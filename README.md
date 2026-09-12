@@ -142,8 +142,6 @@ Your project will be evaluated based on:
 ### Technical Documentation
 - [PyTorch Performance Tuning Guide](https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html)
 - [ONNX Model Optimization](https://onnxruntime.ai/docs/performance/)
-- [NVIDIA TensorRT Developer Guide](https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/)
-- [NVIDIA Triton Inference Server Documentation](https://github.com/triton-inference-server/server)
 - [Intel OpenVino Developer Tools](https://www.intel.com/content/www/us/en/developer/tools/overview.html)
 - [ExecuTorch Documentation](https://docs.pytorch.org/executorch/stable/index.html)
 - [CoreML Documentation](https://developer.apple.com/documentation/coreml)
