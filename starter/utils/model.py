@@ -13,6 +13,7 @@ Key features:
     - Clinical-focused training with early stopping and monitoring
 """
 
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
@@ -393,9 +394,14 @@ def train_baseline_model(model: ResNetBaseline, train_loader, val_loader, device
         'train_acc': [], 'val_acc': [], 'lr': []
     }
     
+    # Ensure checkpoint directory exists before first save.
+    save_dir = Path(save_path).expanduser().resolve().parent
+    save_dir.mkdir(parents=True, exist_ok=True)
+
     # Early stopping for clinical reliability
     best_val_acc = 0.0
     patience_counter = 0
+    best_model_saved = False
     
     # Main training loop with comprehensive monitoring
     for epoch in range(config['num_epochs']):
@@ -489,6 +495,7 @@ def train_baseline_model(model: ResNetBaseline, train_loader, val_loader, device
             patience_counter = 0
             # Save best model for clinical deployment
             torch.save(model.state_dict(), save_path)
+            best_model_saved = True
             print(f"      New best model saved (Val Acc: {val_acc:.1f}%)")
         else:
             patience_counter += 1
@@ -497,8 +504,11 @@ def train_baseline_model(model: ResNetBaseline, train_loader, val_loader, device
                       f"(patience: {config['patience']})")
                 break
     
-    # Load best model for deployment
-    model.load_state_dict(torch.load(save_path))
+    # Load best model for deployment if a checkpoint was created.
+    if best_model_saved and Path(save_path).exists():
+        model.load_state_dict(torch.load(save_path, map_location=device))
+    else:
+        print("     WARNING: No validation improvement checkpoint was written; using last epoch weights.")
     
     print(f"Training completed! Best validation accuracy: {best_val_acc:.2f}%")
     return model, history
