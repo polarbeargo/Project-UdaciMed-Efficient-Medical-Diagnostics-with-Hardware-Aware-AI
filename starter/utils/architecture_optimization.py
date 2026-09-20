@@ -17,12 +17,117 @@ Key optimization strategies:
 """
 
 import copy
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
+
+
+# =====================================================================
+# REUSABLE OPTIMIZED BUILDING BLOCKS
+# =====================================================================
+
+class NativeResolutionWrapper(nn.Module):
+    """Wrap a ResNetBaseline-style model to bypass input interpolation.
+
+    The forward pass calls the underlying backbone directly at native
+    resolution, eliminating the bilinear upscaling overhead identified as the
+    dominant inefficiency in the baseline analysis.
+    """
+
+    def __init__(self, base_model: nn.Module, native_size: int) -> None:
+        super().__init__()
+        # Reuse the underlying backbone if available; otherwise wrap as-is.
+        self.model = getattr(base_model, "model", base_model)
+        self.input_size = native_size
+        self.target_size = native_size
+        self.num_classes = getattr(base_model, "num_classes", None)
+        self.architecture_name = f"{getattr(base_model, 'architecture_name', 'Backbone')}-Native{native_size}"
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # No interpolation: process the image at its native resolution.
+        return self.model(x)
+
+
+class DepthwiseSeparableConv2d(nn.Module):
+    """Depthwise separable replacement for a standard Conv2d.
+
+    Factorizes a spatial convolution into a per-channel depthwise convolution
+    followed by a 1x1 pointwise convolution, drastically reducing FLOPs and
+    parameters while preserving output shape (residual compatible).
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
+                 stride: int = 1, padding: int = 0, dilation: int = 1,
+                 bias: bool = False) -> None:
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            in_channels, in_channels, kernel_size, stride=stride,
+            padding=padding, dilation=dilation, groups=in_channels, bias=bias,
+        )
+        self.bn = nn.BatchNorm2d(in_channels)
+        self.act = nn.ReLU(inplace=True)
+        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.pointwise(self.act(self.bn(self.depthwise(x))))
+
+
+class InvertedResidual(nn.Module):
+    """MobileNetV2-style inverted residual block (expand -> depthwise -> project)."""
+
+    def __init__(self, inp: int, oup: int, stride: int, expand_ratio: int) -> None:
+        super().__init__()
+        self.stride = stride
+        hidden_dim = int(round(inp * expand_ratio))
+        self.use_res_connect = stride == 1 and inp == oup
+
+        layers: List[nn.Module] = []
+        if expand_ratio != 1:
+            # Pointwise expansion.
+            layers += [
+                nn.Conv2d(inp, hidden_dim, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU6(inplace=True),
+            ]
+        layers += [
+            # Depthwise convolution.
+            nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU6(inplace=True),
+            # Linear pointwise projection (no activation).
+            nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(oup),
+        ]
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_res_connect:
+            return x + self.conv(x)
+        return self.conv(x)
+
+
+class LowRankLinear(nn.Module):
+    """Low-rank factorization of a Linear layer: W approx = second @ first."""
+
+    def __init__(self, in_features: int, out_features: int, rank: int, bias: bool = True) -> None:
+        super().__init__()
+        self.first = nn.Linear(in_features, rank, bias=False)
+        self.second = nn.Linear(rank, out_features, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.second(self.first(x))
+
+
+def _replace_module(root: nn.Module, qualified_name: str, new_module: nn.Module) -> None:
+    """Replace a (possibly nested) submodule addressed by its dotted name."""
+    parts = qualified_name.split(".")
+    parent = root
+    for part in parts[:-1]:
+        parent = getattr(parent, part)
+    setattr(parent, parts[-1], new_module)
 
 
 def create_optimized_model(base_model: nn.Module, optimizations: Dict[str, Any]) -> nn.Module:
@@ -57,10 +162,21 @@ def create_optimized_model(base_model: nn.Module, optimizations: Dict[str, Any])
   
     print("Starting clinical model optimization pipeline...")
     
-    # TODO: Define the optimization order by filling in this list
-    # HINT: Consider which optimizations should be applied first and why
-    # Think about: architectural changes → layer modifications → hardware opts → parameter opts
-    optimization_order = []  # Add your code here 
+    # Apply optimizations from coarse structural changes down to fine parameter tweaks:
+    #   1. Architectural change (input resolution) first, so downstream ops see native size.
+    #   2. Block/layer redesigns (inverted residuals, depthwise, grouped conv).
+    #   3. Parameter-level compression (low-rank factorization of linear layers).
+    #   4. Hardware/memory-layout opts (channels_last, in-place activations).
+    #   5. Parameter sharing last, tying weights of whatever layers remain.
+    optimization_order = [
+        'interpolation_removal',   # architectural change: native-resolution input
+        'inverted_residuals',      # block redesign (expand -> depthwise -> project)
+        'depthwise_separable',     # layer modification: factorized convolutions
+        'grouped_conv',            # layer modification: parallel channel groups
+        'lowrank_factorization',   # parameter opt: low-rank linear decomposition
+        'channel_optimization',    # hardware opt: channels_last + in-place ReLU
+        'parameter_sharing',       # parameter opt: tie identical-shape weights
+    ]
     
     # Optimization function mapping - connects optimization names to their implementation
     # IMPORTANT: Make sure to experiment with different input parameters for each optimization function, if performance is suboptimal
@@ -138,7 +254,18 @@ def apply_interpolation_removal_optimization(model: nn.Module, native_size: int 
     #
     # See the ResNetBaseline.forward() method to understand how interpolation currently works.
 
-    # Add your code here
+    if hasattr(optimized_model, "target_size") and hasattr(optimized_model, "model"):
+        # Fast path: the baseline only interpolates when height != target_size.
+        # Setting target_size to the native resolution disables interpolation with
+        # zero wrapping overhead while preserving all trained weights.
+        optimized_model.target_size = native_size
+        optimized_model.input_size = native_size
+        optimized_model.architecture_name = (
+            f"{getattr(optimized_model, 'architecture_name', 'ResNet')}-Native{native_size}"
+        )
+    else:
+        # Robust fallback for arbitrary models: wrap to call the backbone directly.
+        optimized_model = NativeResolutionWrapper(optimized_model, native_size)
 
     # Report optimization status and provide deployment guidance
     print("INTERPOLATION REMOVAL completed.")
@@ -197,7 +324,33 @@ def apply_depthwise_separable_optimization(
     # Also, think about how the residuals are handled.
     # See https://www.paepper.com/blog/posts/depthwise-separable-convolutions-in-pytorch/ for an intuitive explanation and code template.
 
-    # Add your code here
+    # Collect conversion targets first to avoid mutating during iteration.
+    candidates: List[Tuple[str, nn.Conv2d]] = []
+    for name, module in optimized_model.named_modules():
+        if not isinstance(module, nn.Conv2d):
+            continue
+        if layer_names is not None and name not in layer_names:
+            continue
+        # Only spatial, non-grouped convs with enough channels benefit and stay
+        # residual-compatible (output shape is preserved by construction).
+        if (module.kernel_size[0] > 1
+                and module.groups == 1
+                and module.in_channels >= min_channels
+                and module.out_channels >= min_channels):
+            candidates.append((name, module))
+
+    for name, conv in candidates:
+        replacement = DepthwiseSeparableConv2d(
+            in_channels=conv.in_channels,
+            out_channels=conv.out_channels,
+            kernel_size=conv.kernel_size[0],
+            stride=conv.stride[0],
+            padding=conv.padding[0],
+            dilation=conv.dilation[0],
+            bias=conv.bias is not None,
+        )
+        _replace_module(optimized_model, name, replacement)
+        replacements += 1
 
     # Report optimization status
     if replacements > 0:
@@ -256,7 +409,36 @@ def apply_grouped_convolution_optimization(
     # convolutions to each group. To make this happen, you need to ensure that the later is suitable for this transformation.
     # See https://pytorch.org/docs/stable/generated/torch.nn.Conv2d.html for how to use the group parameter.
 
-    # Add your code here
+    candidates: List[Tuple[str, nn.Conv2d]] = []
+    for name, module in optimized_model.named_modules():
+        if not isinstance(module, nn.Conv2d):
+            continue
+        if layer_names is not None and name not in layer_names:
+            continue
+        if module.kernel_size[0] > 1 and module.groups == 1 \
+                and module.in_channels >= min_channels and module.out_channels >= min_channels:
+            candidates.append((name, module))
+
+    for name, conv in candidates:
+        # Depthwise grouping uses groups=in_channels; otherwise use the requested count.
+        target_groups = conv.in_channels if do_depthwise else groups
+        # Grouped conv requires both channel counts divisible by the group count.
+        if conv.in_channels % target_groups != 0 or conv.out_channels % target_groups != 0:
+            skipped += 1
+            continue
+
+        grouped = nn.Conv2d(
+            in_channels=conv.in_channels,
+            out_channels=conv.out_channels,
+            kernel_size=conv.kernel_size,
+            stride=conv.stride,
+            padding=conv.padding,
+            dilation=conv.dilation,
+            groups=target_groups,
+            bias=conv.bias is not None,
+        )
+        _replace_module(optimized_model, name, grouped)
+        replacements += 1
 
     # Report optimization status and provide deployment tipes
     if replacements > 0:
@@ -314,7 +496,29 @@ def apply_inverted_residual_optimization(
     # Check the MobileNetV2 code at https://github.com/tonylins/pytorch-mobilenet-v2/blob/master/MobileNetV2.py 
     # for a code template, and consider whether to use ReLU or ReLU6 and batchnorm.
 
-    # Add your code here
+    from torchvision.models.resnet import BasicBlock
+
+    candidates: List[Tuple[str, BasicBlock]] = []
+    for name, module in optimized_model.named_modules():
+        if not isinstance(module, BasicBlock):
+            continue
+        if target_layers is not None and name not in target_layers:
+            continue
+        candidates.append((name, module))
+
+    for name, block in candidates:
+        # Infer the block's I/O geometry directly from its convolutions.
+        in_channels = block.conv1.in_channels
+        out_channels = block.conv2.out_channels
+        stride = block.conv1.stride[0]
+        replacement = InvertedResidual(
+            inp=in_channels,
+            oup=out_channels,
+            stride=stride,
+            expand_ratio=expand_ratio,
+        )
+        _replace_module(optimized_model, name, replacement)
+        replacements += 1
 
     # Report optimization status
     if replacements > 0:
@@ -371,7 +575,41 @@ def apply_lowrank_factorization(
     # See https://arikpoz.github.io/posts/2025-04-29-low-rank-factorization-in-pytorch-compressing-neural-networks-with-linear-algebra/ 
     # for explanation and code template, and consider how to initialize parameters with respect to the new rank.
 
-    # Add your code here
+    candidates: List[Tuple[str, nn.Linear]] = []
+    for name, module in optimized_model.named_modules():
+        if isinstance(module, nn.Linear) and module.weight.numel() >= min_params:
+            candidates.append((name, module))
+
+    for name, linear in candidates:
+        in_features = linear.in_features
+        out_features = linear.out_features
+        rank = max(1, int(min(in_features, out_features) * rank_ratio))
+
+        # Only factorize when it actually reduces parameters.
+        dense_params = in_features * out_features
+        factorized_params = rank * (in_features + out_features)
+        if factorized_params >= dense_params:
+            continue
+
+        replacement = LowRankLinear(in_features, out_features, rank, bias=linear.bias is not None)
+
+        # Initialize the factors from a truncated SVD of the original weight so the
+        # optimized layer starts as an accurate approximation of the trained layer.
+        with torch.no_grad():
+            weight = linear.weight.detach().float()  # [out, in]
+            u, s, vh = torch.linalg.svd(weight, full_matrices=False)
+            u_r = u[:, :rank]
+            s_r = s[:rank]
+            vh_r = vh[:rank, :]
+            sqrt_s = torch.sqrt(s_r)
+            # first: [rank, in], second: [out, rank]  =>  second @ first ≈ weight
+            replacement.first.weight.copy_((sqrt_s.unsqueeze(1) * vh_r).to(linear.weight.dtype))
+            replacement.second.weight.copy_((u_r * sqrt_s.unsqueeze(0)).to(linear.weight.dtype))
+            if linear.bias is not None:
+                replacement.second.bias.copy_(linear.bias.detach())
+
+        _replace_module(optimized_model, name, replacement)
+        replacements += 1
 
     # Report optimization status
     if replacements > 0:
@@ -426,7 +664,22 @@ def apply_channel_optimization(
     # Also, consider ensuring activations are in place by reviewing https://discuss.pytorch.org/t/whats-the-difference-between-nn-relu-and-nn-relu-inplace-true/948/2 
     # for more details.
 
-    # Add your code here
+    if enable_inplace_relu:
+        # In-place ReLU/ReLU6 avoids allocating a new activation tensor, cutting
+        # memory bandwidth with no effect on outputs.
+        converted = 0
+        for module in optimized_model.modules():
+            if isinstance(module, (nn.ReLU, nn.ReLU6)) and not module.inplace:
+                module.inplace = True
+                converted += 1
+        print(f"   Converted {converted} activation(s) to in-place")
+
+    if enable_channels_last:
+        # channels_last (NHWC) layout lets modern GPUs use faster convolution kernels.
+        # Inputs must also be converted at inference time via
+        # input.to(memory_format=torch.channels_last).
+        optimized_model = optimized_model.to(memory_format=torch.channels_last)
+        print("   Converted model to channels_last memory format")
 
     # Report optimization status
     print("CHANNEL OPTIMIZATION completed")
@@ -487,7 +740,46 @@ def apply_parameter_sharing(
     # See https://stackoverflow.com/questions/57929299/how-to-share-weights-between-modules-in-pytorch 
     # for some inspiration.
 
-    # Add your code here
+    # Resolve every module by name once for quick lookup.
+    module_by_name = dict(optimized_model.named_modules())
+
+    def _is_shareable(mod: nn.Module) -> bool:
+        return any(isinstance(mod, t) for t in layer_types)
+
+    # Build the groups of layers that will share a single parameter set.
+    groups: List[List[nn.Module]] = []
+    if sharing_groups is not None:
+        # Honor caller-specified groupings (referenced by layer name).
+        for group_names in sharing_groups:
+            members = [module_by_name[n] for n in group_names if n in module_by_name]
+            if len(members) > 1:
+                groups.append(members)
+    else:
+        # Auto-group layers that have identical weight shape and conv geometry so
+        # the tied parameter is valid for every member.
+        shape_groups: Dict[Tuple, List[nn.Module]] = {}
+        for module in optimized_model.modules():
+            if not _is_shareable(module) or not hasattr(module, "weight"):
+                continue
+            key = (
+                tuple(module.weight.shape),
+                getattr(module, "stride", None),
+                getattr(module, "padding", None),
+                getattr(module, "dilation", None),
+                getattr(module, "groups", None),
+            )
+            shape_groups.setdefault(key, []).append(module)
+        groups = [members for members in shape_groups.values() if len(members) > 1]
+
+    # Tie each group's later layers to the first member's parameters.
+    for members in groups:
+        base = members[0]
+        for member in members[1:]:
+            member.weight = base.weight
+            if getattr(member, "bias", None) is not None and getattr(base, "bias", None) is not None:
+                member.bias = base.bias
+            total_shared += 1
+            total_parameters_shared += base.weight.numel()
    
     # Report optimization status
     if total_shared > 0:
