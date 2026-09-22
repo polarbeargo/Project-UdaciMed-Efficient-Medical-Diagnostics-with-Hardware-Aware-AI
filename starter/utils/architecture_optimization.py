@@ -239,8 +239,8 @@ def apply_interpolation_removal_optimization(model: nn.Module, native_size: int 
         >>> optimized_model = apply_interpolation_removal_optimization(baseline_model, 64)
         >>> # Model now processes 64x64 images directly without upscaling
     """
-    # Deep copy model to avoid modifying original
-    optimized_model = copy.deepcopy(model)
+    # Work in-place within the optimization pipeline.
+    optimized_model = model
 
     print(f"Applying native resolution optimization ({native_size}x{native_size})...")
     
@@ -311,8 +311,8 @@ def apply_depthwise_separable_optimization(
         ... )
         >>> # Suitable Conv2d layers now use depthwise separable convolutions
     """
-    # Deep copy model to avoid modifying original
-    optimized_model = copy.deepcopy(model)
+    # Work in-place within the optimization pipeline.
+    optimized_model = model
     replacements = 0  # Track number of successful replacements
 
     print("Applying depthwise separable convolution optimization...")
@@ -349,6 +349,28 @@ def apply_depthwise_separable_optimization(
             dilation=conv.dilation[0],
             bias=conv.bias is not None,
         )
+
+        # Initialize from the original conv to preserve learned behavior as much
+        # as possible before fine-tuning.
+        with torch.no_grad():
+            # Depthwise filter per input channel: mean across output channels.
+            dw_weight = conv.weight.mean(dim=0, keepdim=False).unsqueeze(1)
+            replacement.depthwise.weight.copy_(dw_weight.to(conv.weight.dtype))
+            if conv.bias is not None and replacement.depthwise.bias is not None:
+                replacement.depthwise.bias.zero_()
+
+            # Pointwise projection initialized from spatially-averaged kernels.
+            pw_weight = conv.weight.mean(dim=(2, 3), keepdim=True)
+            replacement.pointwise.weight.copy_(pw_weight.to(conv.weight.dtype))
+            if conv.bias is not None and replacement.pointwise.bias is not None:
+                replacement.pointwise.bias.copy_(conv.bias)
+
+            # Keep normalization as close to identity as possible.
+            replacement.bn.weight.fill_(1.0)
+            replacement.bn.bias.zero_()
+            replacement.bn.running_mean.zero_()
+            replacement.bn.running_var.fill_(1.0)
+
         _replace_module(optimized_model, name, replacement)
         replacements += 1
 
@@ -396,8 +418,8 @@ def apply_grouped_convolution_optimization(
         ... )
         >>> # Suitable layers now use 4-group parallel processing
     """
-    # Deep copy model to avoid modifying original
-    optimized_model = copy.deepcopy(model)
+    # Work in-place within the optimization pipeline.
+    optimized_model = model
     # Track number of successful and skipped replacements
     replacements = 0
     skipped = 0
@@ -482,8 +504,8 @@ def apply_inverted_residual_optimization(
         ... )
         >>> # Suitable blocks now use mobile-optimized inverted residuals
     """
-    # Deep copy model to avoid modifying original
-    optimized_model = copy.deepcopy(model)
+    # Work in-place within the optimization pipeline.
+    optimized_model = model
     replacements = 0  # Track number of successful replacements
 
     print(f"Applying mobile inverted residual optimization...")
@@ -561,8 +583,8 @@ def apply_lowrank_factorization(
         ... )
         >>> # Large linear layers now use low-rank factorization
     """
-    # Deep copy model to avoid modifying original
-    optimized_model = copy.deepcopy(model)
+    # Work in-place within the optimization pipeline.
+    optimized_model = model
     replacements = 0  # Track number of successful replacements
 
     print("Applying low-rank factorization optimization...")
@@ -652,8 +674,8 @@ def apply_channel_optimization(
         >>> optimized_model = apply_channel_optimization(model)
         >>> # Remember to convert inputs: input.to(memory_format=torch.channels_last)
     """
-    # Deep copy model to avoid modifying original
-    optimized_model = copy.deepcopy(model)
+    # Work in-place within the optimization pipeline.
+    optimized_model = model
     
     print("Applying channel-level hardware optimizations...")
     
@@ -726,8 +748,8 @@ def apply_parameter_sharing(
     if layer_types is None:
         layer_types = [nn.Conv2d]
 
-    # Deep copy model to avoid modifying original
-    optimized_model = copy.deepcopy(model)
+    # Work in-place within the optimization pipeline.
+    optimized_model = model
     # Track number of sharing layers and shared parameters
     total_shared = 0
     total_parameters_shared = 0
